@@ -1,0 +1,4 @@
+import torch 
+
+#load model
+NER_model = torch.load('model_v1.pt')

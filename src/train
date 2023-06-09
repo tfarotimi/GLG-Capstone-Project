@@ -1,0 +1,249 @@
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+import torch
+import preprocessing
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizerFast, BertConfig, BertForTokenClassification
+from torch import cuda 
+from Bert_NER_Dataset import dataset
+
+#Plot training loss per batch
+import matplotlib.pyplot as plt
+
+#check if gpu is available
+device = 'cuda' if cuda.is_available() else 'cpu'
+print(device)
+
+path = '/home/tfarotimi/Machine Learning/GLG-Capstone-Project/dat/'
+filename = 'ner_dataset.csv'
+
+
+#preprocess data
+ner_dataset, labels_to_ids, ids_to_labels = preprocessing.process_annotated_data(path, filename)
+
+#instantiate Bert for NER model and send to gpu 
+model = BertForTokenClassification.from_pretrained('bert-base-uncased', num_labels=len(labels_to_ids))
+model.to(device)
+
+###################################################################################################################
+def plot_metric(metric, title):
+    x0 = list(range(1, len(metric) + 1))
+    plt.figure(figsize =(10, 5))
+    plt.plot(x0, metric)
+    plt.title(title)
+    plt.show()
+
+#training function 
+def train(training_model, epochs):
+
+  nb_batches = 0
+  nb_tr_sentences = 0
+  avg_loss = 0
+  tr_loss, tr_accuracy = 0, 0
+  nb_tr_examples, nb_tr_steps = 0, 0
+  loss_per_batch = []
+  loss_per_epoch = []
+  acc_per_batch = []
+  acc_per_epoch = []
+
+  model = training_model
+
+  for idx, batch in enumerate(training_loader):
+    
+    tr_preds, tr_labels = [], []
+    # put model in training mode
+    model.train()
+
+    
+    ids = batch['input_ids'].to(device, dtype = torch.long)
+    mask = batch['attention_mask'].to(device, dtype = torch.long)
+    labels = batch['labels'].to(device, dtype = torch.long)
+
+    loss = model(input_ids=ids, attention_mask=mask, labels=labels)[0]
+    tr_logits = model(input_ids=ids, attention_mask=mask, labels=labels)[1]
+
+    #import pdb
+    #pdb.set_trace()
+    
+    tr_loss += loss.item()
+   
+
+    nb_tr_steps += 1
+    nb_tr_sentences += labels.size(0)
+
+    nb_batches += 1
+  
+    
+    if idx % 100==0:
+        loss_step = tr_loss/nb_tr_steps
+        print(f"Training loss per 100 training steps: {loss_step}")
+        
+    # compute training accuracy
+    flattened_targets = labels.view(-1) # shape (batch_size * seq_len,)
+    active_logits = tr_logits.view(-1, model.num_labels) # shape (batch_size * seq_len, num_labels)
+    flattened_predictions = torch.argmax(active_logits, axis=1) # shape (batch_size * seq_len,)
+    
+    # only compute accuracy at active labels
+    active_accuracy = labels.view(-1) != -100 # shape (batch_size, seq_len)
+    #active_labels = torch.where(active_accuracy, labels.view(-1), torch.tensor(-100).type_as(labels))
+    
+    labels = torch.masked_select(flattened_targets, active_accuracy)
+    predictions = torch.masked_select(flattened_predictions, active_accuracy)
+    
+    tr_labels.extend(labels)
+    tr_preds.extend(predictions)
+
+    tmp_tr_accuracy = accuracy_score(labels.cpu().numpy(), predictions.cpu().numpy())
+    tr_accuracy += tmp_tr_accuracy
+
+    # gradient clipping
+    torch.nn.utils.clip_grad_norm_(
+        parameters=model.parameters(), max_norm=MAX_GRAD_NORM
+    )
+    
+    # backward pass
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    epoch_loss = tr_loss / nb_tr_steps
+    loss_per_batch.append(epoch_loss)
+
+    batch_accuracy = tr_accuracy / nb_tr_steps
+    acc_per_batch.append(batch_accuracy)
+
+    print(f"Training loss epoch: {epoch_loss}")
+    print(f"Training accuracy epoch: {tr_accuracy}")
+    print(f"Number of batches: {nb_batches}")  
+    print(f"Number of Sentences Trained on: {nb_tr_sentences}")  
+
+  loss_per_epoch.append(epoch_loss)
+  acc_per_epoch.append(batch_accuracy)
+
+  return (loss_per_batch, loss_per_epoch, acc_per_batch, acc_per_epoch)
+
+#evaluate model
+def valid(eval_model, testing_loader):
+    model = eval_model
+
+    # put model in evaluation mode
+    model.eval()
+    
+    eval_loss, eval_accuracy = 0, 0
+    nb_eval_examples, nb_eval_steps = 0, 0
+    eval_preds, eval_labels = [], []
+    loss_per_epoch, acc_per_epoch = [], []
+    
+    with torch.no_grad():
+        for idx, batch in enumerate(testing_loader):
+            
+            ids = batch['input_ids'].to(device, dtype = torch.long)
+            mask = batch['attention_mask'].to(device, dtype = torch.long)
+            labels = batch['labels'].to(device, dtype = torch.long)
+            
+            loss = model(input_ids=ids, attention_mask=mask, labels=labels)[0]
+            eval_logits = model(input_ids=ids, attention_mask=mask, labels=labels)[1]
+            eval_loss += loss.item()
+
+            nb_eval_steps += 1
+            nb_eval_examples += labels.size(0)
+        
+            if idx % 100==0:
+                loss_step = eval_loss/nb_eval_steps
+                print(f"Validation loss per 100 evaluation steps: {loss_step}")
+              
+            # compute evaluation accuracy
+            flattened_targets = labels.view(-1) # shape (batch_size * seq_len,)
+            active_logits = eval_logits.view(-1, model.num_labels) # shape (batch_size * seq_len, num_labels)
+            flattened_predictions = torch.argmax(active_logits, axis=1) # shape (batch_size * seq_len,)
+            
+            # only compute accuracy at active labels
+            active_accuracy = labels.view(-1) != -100 # shape (batch_size, seq_len)
+        
+            labels = torch.masked_select(flattened_targets, active_accuracy)
+            predictions = torch.masked_select(flattened_predictions, active_accuracy)
+            
+            eval_labels.extend(labels)
+            eval_preds.extend(predictions)
+            
+            tmp_eval_accuracy = accuracy_score(labels.cpu().numpy(), predictions.cpu().numpy())
+            eval_accuracy += tmp_eval_accuracy
+
+    labels = [ids_to_labels[id.item()] for id in eval_labels]
+    predictions = [ids_to_labels[id.item()] for id in eval_preds]
+    
+    eval_loss = eval_loss / nb_eval_steps
+    eval_accuracy = eval_accuracy / nb_eval_steps
+
+    loss_per_epoch.append(eval_loss)
+    acc_per_epoch.append(eval_accuracy)
+    
+    print(f"Validation Loss: {eval_loss}")
+    print(f"Validation Accuracy: {eval_accuracy}")
+
+    return labels, predictions, loss_per_epoch, acc_per_epoch
+
+#########################################################################################################################################################################
+
+
+
+#define parameters
+MAX_LEN = 128
+TRAIN_BATCH_SIZE = 16
+VALID_BATCH_SIZE = 16
+EPOCHS = 1
+LEARNING_RATE = 1e-05
+MAX_GRAD_NORM = 10
+tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
+
+#split into training and testing 
+train_set, test_set = train_test_split(ner_dataset, train_size = 0.8, random_state = 42)
+
+#transform training and testing data into dataset objects
+training_set = dataset(train_set, tokenizer, labels_to_ids, MAX_LEN)
+testing_set = dataset(test_set, tokenizer, labels_to_ids, MAX_LEN)
+
+#set training and testing parameters
+train_params = {'batch_size': TRAIN_BATCH_SIZE,
+                'shuffle': True,
+                'num_workers': 0
+                }
+
+test_params = {'batch_size': VALID_BATCH_SIZE,
+                'shuffle': True,
+                'num_workers': 0
+                }
+
+#instantiate training and testing dataloaders
+training_loader = DataLoader(training_set, **train_params)
+testing_loader = DataLoader(testing_set, **test_params)
+
+#instantiate optimizer and scheduler
+optimizer = torch.optim.Adam(params =  model.parameters(), lr=LEARNING_RATE)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=2, verbose=True)
+
+
+#train model
+
+for epoch in range(EPOCHS):
+    print(f"Training epoch: {epoch + 1}")
+    batch_loss,epoch_loss, batch_acc, epoch_acc = train(model, epoch)
+
+plot_metric(batch_loss, 'Cumulative Average Loss for all Batches Trained')
+
+plot_metric(batch_acc, 'Cumulative Average Accuracy for all Batches Trained')
+
+
+#evaluate model
+labels, predictions, epoch_loss, epoch_accuracy = valid(model, testing_loader)
+
+#display classification report
+print(classification_report(labels, predictions))
+
+plot_metric(epoch_loss, 'Loss per Epoch')
+
+plot_metric(epoch_accuracy, 'Accuracy per Epoch')
+
+#save model
+torch.save(model.state_dict(), 'model_v1.pt')
